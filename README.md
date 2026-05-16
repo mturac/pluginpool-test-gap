@@ -1,3 +1,5 @@
+![hero](./assets/hero.svg)
+
 # test-gap
 
 **Surface the lines you just changed that have zero test coverage — before the PR review does.**
