@@ -18,10 +18,13 @@ from pathlib import Path
 class CoverageFile:
     covered: set[int]
     uncovered: set[int]
-    pct: float
+    pct: float | None  # None when the report does not cover this file
 
 
 HUNK_RE = re.compile(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+GIT_HEADER_RE = re.compile(r"^diff --git ")
+NEW_FILE_HEADER_RE = re.compile(r"^\+\+\+ (.+)$")
+OLD_FILE_HEADER_RE = re.compile(r"^--- (.+)$")
 
 
 def run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
@@ -43,17 +46,49 @@ def git_diff(base: str) -> str:
     return result.stdout
 
 
+def _strip_diff_prefix(path: str) -> str:
+    """Remove the conventional ``a/`` / ``b/`` prefix from a diff filename.
+
+    Honours ``--no-prefix`` style configurations by tolerating either form;
+    a path like ``src/foo.py`` is returned unchanged.
+    """
+    for prefix in ("a/", "b/"):
+        if path.startswith(prefix):
+            return path[len(prefix):]
+    return path
+
+
 def parse_diff(diff_text: str) -> dict[str, list[int]]:
+    """Parse a unified diff into ``{path: [changed line numbers]}``.
+
+    Uses a small state machine so a content line that happens to begin with
+    ``+++ `` (e.g. a C++ comment) is not mistaken for a file header. A real
+    file header MUST appear immediately after a ``diff --git`` line followed
+    by an ``--- `` line — without that sequence, ``+++`` is content.
+    """
     changed: dict[str, set[int]] = {}
     current_file: str | None = None
     current_line: int | None = None
+    saw_diff_git = False
+    saw_old_header = False
 
     for line in diff_text.splitlines():
-        if line.startswith("+++ "):
+        if GIT_HEADER_RE.match(line):
+            saw_diff_git = True
+            saw_old_header = False
+            current_file = None
+            current_line = None
+            continue
+        if saw_diff_git and not saw_old_header and OLD_FILE_HEADER_RE.match(line):
+            saw_old_header = True
+            continue
+        if saw_old_header and NEW_FILE_HEADER_RE.match(line):
             path = line[4:].strip()
-            current_file = None if path == "/dev/null" else path.removeprefix("b/")
+            current_file = None if path == "/dev/null" else _strip_diff_prefix(path)
             if current_file:
                 changed.setdefault(current_file, set())
+            saw_old_header = False
+            saw_diff_git = False
             continue
 
         match = HUNK_RE.match(line)
@@ -63,10 +98,13 @@ def parse_diff(diff_text: str) -> dict[str, list[int]]:
 
         if current_file is None or current_line is None:
             continue
-        if line.startswith("+") and not line.startswith("+++"):
+        # Inside a hunk every ``+``-prefixed line is an addition, even if its
+        # payload happens to start with ``+++`` or ``++ ``. The file-header
+        # check above already consumed the real ``+++ b/path`` line.
+        if line.startswith("+"):
             changed[current_file].add(current_line)
             current_line += 1
-        elif line.startswith("-") and not line.startswith("---"):
+        elif line.startswith("-"):
             continue
         elif line.startswith(" "):
             current_line += 1
@@ -79,6 +117,26 @@ def pct(covered: set[int], uncovered: set[int]) -> float:
     return round((len(covered) / total) * 100, 2) if total else 100.0
 
 
+def _merge_into(files: dict[str, CoverageFile], key: str,
+                covered: set[int], uncovered: set[int]) -> None:
+    """Merge a new (covered, uncovered) pair into ``files[key]``.
+
+    Same-key entries (e.g. duplicate Cobertura <class> elements for one
+    filename) are accumulated rather than overwritten — review #2 found that
+    the previous "last write wins" behaviour silently dropped coverage from
+    inner classes or alternate packages sharing a filename.
+    """
+    if key in files:
+        files[key].covered |= covered
+        files[key].uncovered |= uncovered - files[key].covered
+        # Lines that became covered later should leave the uncovered set.
+        files[key].uncovered -= files[key].covered
+        files[key].pct = pct(files[key].covered, files[key].uncovered)
+    else:
+        files[key] = CoverageFile(set(covered), set(uncovered) - set(covered),
+                                  pct(covered, uncovered))
+
+
 def parse_lcov(path: Path) -> dict[str, CoverageFile]:
     files: dict[str, CoverageFile] = {}
     current: str | None = None
@@ -87,14 +145,14 @@ def parse_lcov(path: Path) -> dict[str, CoverageFile]:
 
     def flush() -> None:
         if current is not None:
-            files[normalize(current)] = CoverageFile(set(covered), set(uncovered), pct(covered, uncovered))
+            _merge_into(files, normalize(current), covered, uncovered)
 
     for raw in path.read_text(encoding="utf-8").splitlines():
         if raw.startswith("SF:"):
             flush()
             current = raw[3:]
-            covered.clear()
-            uncovered.clear()
+            covered = set()
+            uncovered = set()
         elif raw.startswith("DA:") and current is not None:
             line_no, hits, *_ = raw[3:].split(",")
             target = covered if int(float(hits)) > 0 else uncovered
@@ -102,14 +160,30 @@ def parse_lcov(path: Path) -> dict[str, CoverageFile]:
         elif raw == "end_of_record":
             flush()
             current = None
-            covered.clear()
-            uncovered.clear()
+            covered = set()
+            uncovered = set()
     flush()
     return files
 
 
+def _cobertura_source_roots(root: ET.Element) -> list[str]:
+    """Return every ``<source>`` directory listed in the Cobertura report.
+
+    Used as a candidate prefix list when matching report filenames to the
+    paths reported by git diff. An empty list means "no extra prefixes".
+    """
+    out: list[str] = []
+    for src in root.findall(".//sources/source"):
+        if src.text:
+            cleaned = src.text.strip()
+            if cleaned:
+                out.append(cleaned)
+    return out
+
+
 def parse_cobertura(path: Path) -> dict[str, CoverageFile]:
     root = ET.parse(path).getroot()
+    sources = _cobertura_source_roots(root)
     files: dict[str, CoverageFile] = {}
     for class_node in root.findall(".//class"):
         filename = class_node.get("filename")
@@ -124,7 +198,14 @@ def parse_cobertura(path: Path) -> dict[str, CoverageFile]:
                 continue
             target = covered if int(float(hits)) > 0 else uncovered
             target.add(int(number))
-        files[normalize(filename)] = CoverageFile(covered, uncovered, pct(covered, uncovered))
+        # Index the report under both its bare filename and under every
+        # source-root-joined variant so a downstream lookup against the diff
+        # path can match either shape.
+        _merge_into(files, normalize(filename), covered, uncovered)
+        for source in sources:
+            joined = normalize(os.path.join(source, filename))
+            if joined != normalize(filename):
+                _merge_into(files, joined, covered, uncovered)
     return files
 
 
@@ -136,7 +217,9 @@ def parse_coverage_json(path: Path) -> dict[str, CoverageFile]:
         uncovered = set(map(int, data.get("missing_lines", [])))
         summary = data.get("summary", {})
         percent = summary.get("percent_covered")
-        files[normalize(filename)] = CoverageFile(covered, uncovered, round(float(percent), 2) if percent is not None else pct(covered, uncovered))
+        explicit_pct = round(float(percent), 2) if percent is not None else pct(covered, uncovered)
+        _merge_into(files, normalize(filename), covered, uncovered)
+        files[normalize(filename)].pct = explicit_pct
     return files
 
 
@@ -167,17 +250,25 @@ def parse_report(path: Path | None) -> dict[str, CoverageFile]:
     raise SystemExit(f"Unsupported coverage report: {path}")
 
 
-_UNKNOWN_PCT = -1.0  # sentinel: no coverage info for this file
-
-
 def coverage_for(path: str, coverage: dict[str, CoverageFile]) -> CoverageFile:
+    """Best-effort path lookup. Exact match wins; failing that, find a
+    candidate that lines up at a directory boundary on either side."""
     norm = normalize(path)
     if norm in coverage:
         return coverage[norm]
+    best: CoverageFile | None = None
+    best_len = -1
     for candidate, data in coverage.items():
+        # require a path-component boundary on one side
         if candidate.endswith("/" + norm) or norm.endswith("/" + candidate):
-            return data
-    return CoverageFile(set(), set(), _UNKNOWN_PCT)
+            # prefer the longest overlap to reduce ambiguity on common suffixes
+            overlap = min(len(candidate), len(norm))
+            if overlap > best_len:
+                best_len = overlap
+                best = data
+    if best is not None:
+        return best
+    return CoverageFile(set(), set(), None)
 
 
 def build_result(changed: dict[str, list[int]], coverage: dict[str, CoverageFile]) -> dict[str, list[dict[str, object]]]:
@@ -185,7 +276,7 @@ def build_result(changed: dict[str, list[int]], coverage: dict[str, CoverageFile
     files: list[dict[str, object]] = []
     for path in sorted(changed):
         data = coverage_for(path, coverage)
-        if data.pct == _UNKNOWN_PCT:
+        if data.pct is None:
             uncovered = list(changed[path])  # unknown → treat every changed line as a gap
             cov_pct: object = None
         else:
