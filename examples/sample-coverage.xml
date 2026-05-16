@@ -1,0 +1,19 @@
+<?xml version="1.0" ?>
+<coverage version="6.0">
+  <packages>
+    <package name="src.auth">
+      <classes>
+        <class filename="src/auth/refresh.py" line-rate="0.72">
+          <lines>
+            <line number="10" hits="1"/>
+            <line number="11" hits="1"/>
+            <line number="12" hits="0"/>
+            <line number="13" hits="0"/>
+            <line number="14" hits="0"/>
+            <line number="15" hits="1"/>
+          </lines>
+        </class>
+      </classes>
+    </package>
+  </packages>
+</coverage>

@@ -1,0 +1,7 @@
+diff --git a/src/auth/refresh.py b/src/auth/refresh.py
+@@ -10,1 +10,6 @@ class Refresh:
++    new line 11
++    new line 12
++    new line 13
++    new line 14
++    new line 15

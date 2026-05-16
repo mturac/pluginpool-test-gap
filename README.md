@@ -74,6 +74,10 @@ python3 scripts/gap.py --base develop --report build/lcov.info
 - Cobertura paths must match diff paths; configure your runner to emit project-relative paths.
 - Empty diffs and no-test repos are handled gracefully (no output).
 
+## Examples
+
+Step-by-step walkthroughs with real input fixtures and the helper's actual output live in [`examples/`](./examples/README.md). Three or four scenarios per plugin — from the happy path to the edge cases the test suite guards.
+
 ## Part of the pluginpool family
 
 Ten focused Claude Code plugins for everyday productivity:
